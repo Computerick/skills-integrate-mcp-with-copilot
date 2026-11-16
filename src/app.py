@@ -5,14 +5,93 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+import hashlib
+import logging
 import os
 from pathlib import Path
+import secrets
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from starlette.middleware.sessions import SessionMiddleware
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+logger = logging.getLogger(__name__)
+
+SESSION_SECRET_KEY = os.getenv("SESSION_SECRET_KEY")
+SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "true").lower()
+if SESSION_COOKIE_SECURE not in {"true", "false"}:
+    raise ValueError("SESSION_COOKIE_SECURE must be 'true' or 'false'")
+
+
+def parse_password_hash(value: str | None) -> tuple[int, bytes, bytes] | None:
+    if not value:
+        return None
+
+    try:
+        algorithm, iterations_value, salt_value, digest_value = value.split("$")
+        iterations = int(iterations_value)
+        salt = bytes.fromhex(salt_value)
+        digest = bytes.fromhex(digest_value)
+    except ValueError:
+        logger.error("ADMIN_PASSWORD_HASH has an invalid format")
+        return None
+
+    if (
+        algorithm != "pbkdf2_sha256"
+        or iterations < 600_000
+        or len(salt) < 16
+        or len(digest) != 32
+    ):
+        logger.error("ADMIN_PASSWORD_HASH does not meet the required format")
+        return None
+
+    return iterations, salt, digest
+
+
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME")
+ADMIN_PASSWORD_HASH = parse_password_hash(os.getenv("ADMIN_PASSWORD_HASH"))
+ADMIN_AUTH_CONFIGURED = bool(
+    ADMIN_USERNAME
+    and ADMIN_PASSWORD_HASH
+    and SESSION_SECRET_KEY
+    and len(SESSION_SECRET_KEY) >= 32
+)
+
+if not ADMIN_AUTH_CONFIGURED:
+    logger.warning(
+        "Admin authentication is disabled. Configure ADMIN_USERNAME, "
+        "ADMIN_PASSWORD_HASH, and a SESSION_SECRET_KEY of at least 32 characters."
+    )
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET_KEY or secrets.token_urlsafe(32),
+    session_cookie="mergington_admin_session",
+    max_age=8 * 60 * 60,
+    same_site="lax",
+    https_only=SESSION_COOKIE_SECURE == "true",
+)
+
+
+class AdminCredentials(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+
+
+def require_admin(request: Request) -> None:
+    if not ADMIN_AUTH_CONFIGURED:
+        raise HTTPException(
+            status_code=503,
+            detail="Administrator authentication is not configured",
+        )
+    if request.session.get("admin_authenticated") is not True:
+        raise HTTPException(status_code=401, detail="Administrator login required")
+
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -88,9 +167,54 @@ def get_activities():
     return activities
 
 
+@app.get("/admin/session")
+def get_admin_session(request: Request):
+    return {
+        "authenticated": ADMIN_AUTH_CONFIGURED
+        and request.session.get("admin_authenticated") is True
+    }
+
+
+@app.post("/admin/login")
+def admin_login(credentials: AdminCredentials, request: Request):
+    if not ADMIN_AUTH_CONFIGURED:
+        raise HTTPException(
+            status_code=503,
+            detail="Administrator authentication is not configured",
+        )
+
+    request.session.clear()
+    username_matches = secrets.compare_digest(
+        credentials.username.encode("utf-8"),
+        ADMIN_USERNAME.encode("utf-8"),
+    )
+    iterations, salt, expected_digest = ADMIN_PASSWORD_HASH
+    provided_digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        credentials.password.encode("utf-8"),
+        salt,
+        iterations,
+    )
+    password_matches = secrets.compare_digest(provided_digest, expected_digest)
+
+    if not username_matches or not password_matches:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    request.session["admin_authenticated"] = True
+    return {"authenticated": True}
+
+
+@app.post("/admin/logout")
+def admin_logout(request: Request):
+    request.session.clear()
+    return {"authenticated": False}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, request: Request):
     """Sign up a student for an activity"""
+    require_admin(request)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +235,10 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, request: Request):
     """Unregister a student from an activity"""
+    require_admin(request)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")

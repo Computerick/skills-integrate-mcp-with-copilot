@@ -2,7 +2,32 @@ document.addEventListener("DOMContentLoaded", () => {
   const activitiesList = document.getElementById("activities-list");
   const activitySelect = document.getElementById("activity");
   const signupForm = document.getElementById("signup-form");
+  const signupContainer = document.getElementById("signup-container");
   const messageDiv = document.getElementById("message");
+  const adminLoginButton = document.getElementById("admin-login-button");
+  const adminLogoutButton = document.getElementById("admin-logout-button");
+  const adminLoginDialog = document.getElementById("admin-login-dialog");
+  const adminLoginForm = document.getElementById("admin-login-form");
+  const adminLoginMessage = document.getElementById("admin-login-message");
+  const adminPassword = document.getElementById("admin-password");
+  let isAdmin = false;
+
+  function setAdminState(authenticated) {
+    isAdmin = authenticated;
+    adminLoginButton.classList.toggle("hidden", isAdmin);
+    adminLogoutButton.classList.toggle("hidden", !isAdmin);
+    signupContainer.classList.toggle("hidden", !isAdmin);
+  }
+
+  function showMessage(message, type) {
+    messageDiv.textContent = message;
+    messageDiv.className = `message ${type}`;
+    messageDiv.classList.remove("hidden");
+
+    setTimeout(() => {
+      messageDiv.classList.add("hidden");
+    }, 5000);
+  }
 
   // Function to fetch activities from API
   async function fetchActivities() {
@@ -12,6 +37,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
       // Clear loading message
       activitiesList.innerHTML = "";
+      activitySelect.innerHTML =
+        '<option value="">-- Select an activity --</option>';
 
       // Populate activities list
       Object.entries(activities).forEach(([name, details]) => {
@@ -29,8 +56,14 @@ document.addEventListener("DOMContentLoaded", () => {
               <ul class="participants-list">
                 ${details.participants
                   .map(
-                    (email) =>
-                      `<li><span class="participant-email">${email}</span><button class="delete-btn" data-activity="${name}" data-email="${email}">❌</button></li>`
+                    (email) => `<li>
+                      <span class="participant-email">${email}</span>
+                      ${
+                        isAdmin
+                          ? `<button class="delete-btn" data-activity="${name}" data-email="${email}" aria-label="Unregister ${email} from ${name}">❌</button>`
+                          : ""
+                      }
+                    </li>`
                   )
                   .join("")}
               </ul>
@@ -67,6 +100,21 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
+  async function fetchAdminSession() {
+    try {
+      const response = await fetch("/admin/session");
+      if (!response.ok) {
+        throw new Error("Failed to check administrator session");
+      }
+
+      const result = await response.json();
+      setAdminState(result.authenticated === true);
+    } catch (error) {
+      setAdminState(false);
+      console.error("Error checking administrator session:", error);
+    }
+  }
+
   // Handle unregister functionality
   async function handleUnregister(event) {
     const button = event.target;
@@ -86,29 +134,86 @@ document.addEventListener("DOMContentLoaded", () => {
       const result = await response.json();
 
       if (response.ok) {
-        messageDiv.textContent = result.message;
-        messageDiv.className = "success";
-
         // Refresh activities list to show updated participants
-        fetchActivities();
+        await fetchActivities();
+        showMessage(result.message, "success");
       } else {
-        messageDiv.textContent = result.detail || "An error occurred";
-        messageDiv.className = "error";
+        if (response.status === 401) {
+          setAdminState(false);
+          await fetchActivities();
+        }
+        showMessage(result.detail || "An error occurred", "error");
       }
-
-      messageDiv.classList.remove("hidden");
-
-      // Hide message after 5 seconds
-      setTimeout(() => {
-        messageDiv.classList.add("hidden");
-      }, 5000);
     } catch (error) {
-      messageDiv.textContent = "Failed to unregister. Please try again.";
-      messageDiv.className = "error";
-      messageDiv.classList.remove("hidden");
+      showMessage("Failed to unregister. Please try again.", "error");
       console.error("Error unregistering:", error);
     }
   }
+
+  adminLoginButton.addEventListener("click", () => {
+    adminLoginDialog.showModal();
+  });
+
+  document
+    .getElementById("admin-login-cancel")
+    .addEventListener("click", () => {
+      adminLoginDialog.close();
+    });
+
+  adminLoginForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    adminLoginMessage.textContent = "";
+    adminLoginMessage.className = "message hidden";
+
+    try {
+      const response = await fetch("/admin/login", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          username: document.getElementById("admin-username").value,
+          password: adminPassword.value,
+        }),
+      });
+
+      const result = await response.json();
+      adminPassword.value = "";
+
+      if (!response.ok) {
+        adminLoginMessage.textContent =
+          result.detail || "Unable to sign in. Please try again.";
+        adminLoginMessage.className = "message error";
+        return;
+      }
+
+      setAdminState(true);
+      adminLoginDialog.close();
+      await fetchActivities();
+      showMessage("Signed in as a teacher.", "info");
+    } catch (error) {
+      adminPassword.value = "";
+      adminLoginMessage.textContent = "Unable to sign in. Please try again.";
+      adminLoginMessage.className = "message error";
+      console.error("Error signing in:", error);
+    }
+  });
+
+  adminLogoutButton.addEventListener("click", async () => {
+    try {
+      const response = await fetch("/admin/logout", { method: "POST" });
+      if (!response.ok) {
+        throw new Error("Failed to sign out");
+      }
+
+      setAdminState(false);
+      await fetchActivities();
+      showMessage("Signed out.", "info");
+    } catch (error) {
+      showMessage("Unable to sign out. Please try again.", "error");
+      console.error("Error signing out:", error);
+    }
+  });
 
   // Handle form submission
   signupForm.addEventListener("submit", async (event) => {
@@ -130,31 +235,24 @@ document.addEventListener("DOMContentLoaded", () => {
       const result = await response.json();
 
       if (response.ok) {
-        messageDiv.textContent = result.message;
-        messageDiv.className = "success";
         signupForm.reset();
 
         // Refresh activities list to show updated participants
-        fetchActivities();
+        await fetchActivities();
+        showMessage(result.message, "success");
       } else {
-        messageDiv.textContent = result.detail || "An error occurred";
-        messageDiv.className = "error";
+        if (response.status === 401) {
+          setAdminState(false);
+          await fetchActivities();
+        }
+        showMessage(result.detail || "An error occurred", "error");
       }
-
-      messageDiv.classList.remove("hidden");
-
-      // Hide message after 5 seconds
-      setTimeout(() => {
-        messageDiv.classList.add("hidden");
-      }, 5000);
     } catch (error) {
-      messageDiv.textContent = "Failed to sign up. Please try again.";
-      messageDiv.className = "error";
-      messageDiv.classList.remove("hidden");
+      showMessage("Failed to sign up. Please try again.", "error");
       console.error("Error signing up:", error);
     }
   });
 
   // Initialize app
-  fetchActivities();
+  fetchAdminSession().then(fetchActivities);
 });
